@@ -386,6 +386,85 @@ func ExampleUnion() {
 }
 ```
 
+## Transaction fragment loading
+
+Goavro can act as a transactional sink for change-data-capture style
+streams.  Producers emit two record types, each wrapped in the
+Confluent-style wire header (`0x00` + 4-byte big-endian schema ID + Avro
+binary payload):
+
+- `TxData` — one row change, carrying `txID`, zero-based `slot`, target
+  `table`, an I/U/D `op`, and the row content as a map whose values are a
+  union covering `null`, primitives, `bytes` and an exact `TxDecimal`
+  record (`unscaled` two's-complement bytes + `scale`).
+- `TxCommit` — the transaction boundary, carrying the continuous
+  `commitSeq` and the total `slotCount` (zero for an empty transaction).
+
+`FragmentLoader` gives these guarantees:
+
+1. **Persist first, apply later.** Every decoded fragment and the receive
+   cursor are committed to SQLite bookkeeping tables before any target
+   table is touched.
+2. **Receive progress is not applied progress.** `ReceivePosition` only
+   counts accepted messages; `AppliedHead` advances exclusively inside the
+   same SQLite transaction that commits the target rows, so it can never
+   overtake what is actually durable.
+3. **Apply only when all slots are present, strictly in slot and commit
+   order.** Fragments may arrive interleaved across transactions,
+   duplicated, or with the commit fragment first.
+4. **Idempotent duplicates, rejected conflicts.** Re-sending an identical
+   `(txID, slot)` data fragment or an identical commit is a no-op;
+   different content for the same slot/txID (or a reused `commitSeq`)
+   returns `ErrConflict` and advances nothing.
+5. **Empty transactions advance the head.**
+6. **Deferred foreign keys.** `PRAGMA defer_foreign_keys=ON` per apply
+   transaction lets child rows be written before their parents; a final
+   constraint violation or any write failure rolls the whole transaction
+   back, returns `ErrBlocked`, and keeps every later transaction waiting.
+   The already-applied prefix stays committed; call `Pump` again after
+   fixing the underlying condition.
+7. **Crash recovery.** Reopening the database restores the applied head
+   and all pending fragments; replaying old messages never double-applies.
+8. **Value fidelity.** `NULL`, `0`, and `false` stay distinct; decimals
+   are written as exact decimal text (no float conversion, scale
+   preserved); `bytes` map to BLOBs.
+
+```go
+registry, _ := goavro.NewDefaultSchemaRegistry()
+
+loader, err := goavro.NewFragmentLoader(goavro.FragmentLoaderConfig{
+    DSN:      "file:loader.db",
+    Registry: registry,
+    Bindings: map[string]goavro.TableBinding{
+        "orders": {
+            Table:      "orders",
+            Columns:    []string{"id", "customer_id", "total"},
+            PrimaryKey: []string{"id"},
+        },
+    },
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer loader.Close()
+
+// wire is a 0x00 | schemaID | Avro-binary message read from the stream.
+result, err := loader.Ingest(wire)
+if err != nil {
+    // Decoding or persistence failure: nothing was accepted.
+    log.Fatal(err)
+}
+if result.PumpError != nil {
+    // Persisted, but the head transaction is blocked (see ErrBlocked).
+    log.Printf("blocked at appliedHead %d: %v", result.AppliedHead, result.PumpError)
+}
+```
+
+A complete runnable program lives under
+[`examples/txloader`](examples/txloader/main.go).  The loader uses the
+CGO-based `github.com/mattn/go-sqlite3` driver (a C toolchain is required
+to build).
+
 ## Limitations
 
 Goavro is a fully featured encoder and decoder of binary and textual
